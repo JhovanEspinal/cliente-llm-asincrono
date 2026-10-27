@@ -1,5 +1,3 @@
-"""AsyncLLMManager: elige el proveedor por configuracion y agrega resiliencia."""
-
 import asyncio
 import logging
 import os
@@ -21,6 +19,7 @@ from .schemas import (
 
 log = logging.getLogger("llm_client")
 
+DEFAULT_PROVIDER = "anthropic"
 DEFAULT_MODELS: dict[str, str] = {
     "openai": "gpt-4o-mini",
     "anthropic": "claude-haiku-5-5",
@@ -29,11 +28,10 @@ API_KEY_VARS: dict[str, str] = {
     "openai": "OPENAI_API_KEY",
     "anthropic": "ANTHROPIC_API_KEY",
 }
+JITTER_RANGE = (0.5, 1.0)
 
 
-def _to_info(exc: Exception) -> ErrorInfo:
-    """Errores del proveedor ya vienen normalizados; el resto se registra con
-    traceback y se devuelve como `unknown` (no reintentable) en vez de tumbar el loop."""
+def error_info_from(exc: Exception) -> ErrorInfo:
     if isinstance(exc, LLMError):
         return exc.info
     log.exception("Error inesperado en el cliente LLM")
@@ -41,7 +39,6 @@ def _to_info(exc: Exception) -> ErrorInfo:
 
 
 def build_client(provider: str) -> BaseLLMClient:
-    """Factory: crea el cliente concreto leyendo las variables de entorno."""
     if provider not in API_KEY_VARS:
         raise ValueError(
             f"Proveedor desconocido: {provider!r}. Opciones: {', '.join(API_KEY_VARS)}"
@@ -51,23 +48,25 @@ def build_client(provider: str) -> BaseLLMClient:
     if not api_key:
         raise ValueError(f"Falta la variable de entorno {key_var} para {provider}.")
     model = os.getenv(f"{provider.upper()}_MODEL") or DEFAULT_MODELS[provider]
-    cls = OpenAIClient if provider == "openai" else AnthropicClient
-    return cls(
+    client_class = OpenAIClient if provider == "openai" else AnthropicClient
+    return client_class(
         api_key=SecretStr(api_key),
         model=model,
         base_url=os.getenv(f"{provider.upper()}_BASE_URL") or None,
     )
 
 
+def exponential_backoff_with_jitter(attempt: int, config: ModelConfig) -> float:
+    return config.retry_base_delay_s * 2 ** (attempt - 1) * random.uniform(*JITTER_RANGE)
+
+
+def should_retry(
+    info: ErrorInfo, attempt: int, config: ModelConfig, text_already_emitted: bool = False
+) -> bool:
+    return info.retryable and not text_already_emitted and attempt <= config.max_retries
+
+
 class AsyncLLMManager:
-    """Interfaz unica sobre cualquier proveedor.
-
-    Los fallos del proveedor (red, rate limit, API key invalida...) nunca salen
-    como excepcion: generate() devuelve un ModelResponse con `error` y stream()
-    emite un StreamChunk final con `error`. Solo la configuracion invalida al
-    construir el manager lanza ValueError, para fallar de forma clara y temprana.
-    """
-
     def __init__(
         self,
         provider: Provider | None = None,
@@ -75,24 +74,15 @@ class AsyncLLMManager:
         config: ModelConfig | None = None,
     ) -> None:
         self.config = config or ModelConfig()
-        if client is not None:
-            self.client = client
-        else:
-            self.client = build_client(provider or os.getenv("LLM_PROVIDER", "anthropic"))
-
-    @staticmethod
-    def _as_messages(prompt: str | list[ChatMessage]) -> list[ChatMessage]:
-        return [ChatMessage(role="user", content=prompt)] if isinstance(prompt, str) else prompt
-
-    def _delay(self, attempt: int, config: ModelConfig) -> float:
-        # Backoff exponencial con jitter para no sincronizar reintentos.
-        return config.retry_base_delay_s * 2 ** (attempt - 1) * random.uniform(0.5, 1.0)
+        self.client = client or build_client(
+            provider or os.getenv("LLM_PROVIDER", DEFAULT_PROVIDER)
+        )
 
     async def generate(
         self, prompt: str | list[ChatMessage], config: ModelConfig | None = None
     ) -> ModelResponse:
         config = config or self.config
-        messages = self._as_messages(prompt)
+        messages = as_messages(prompt)
         attempt = 0
         while True:
             attempt += 1
@@ -101,16 +91,14 @@ class AsyncLLMManager:
                 response.attempts = attempt
                 return response
             except Exception as exc:
-                info = _to_info(exc)
-                if info.retryable and attempt <= config.max_retries:
-                    delay = self._delay(attempt, config)
-                    log.warning(
-                        "%s fallo (%s); reintento %d/%d en %.1fs",
-                        self.client.provider, info.kind, attempt, config.max_retries, delay,
-                    )
-                    await asyncio.sleep(delay)
+                info = error_info_from(exc)
+                if should_retry(info, attempt, config):
+                    await self._wait_before_retry(info, attempt, config)
                     continue
-                log.error("%s fallo definitivo (%s): %s", self.client.provider, info.kind, info.message)
+                log.error(
+                    "%s fallo definitivo (%s): %s",
+                    self.client.provider, info.kind, info.message,
+                )
                 return ModelResponse(
                     provider=self.client.provider,
                     model=self.client.model,
@@ -122,28 +110,40 @@ class AsyncLLMManager:
         self, prompt: str | list[ChatMessage], config: ModelConfig | None = None
     ) -> AsyncIterator[StreamChunk]:
         config = config or self.config
-        messages = self._as_messages(prompt)
+        messages = as_messages(prompt)
         attempt = 0
         while True:
             attempt += 1
-            emitted = False
+            text_already_emitted = False
             try:
                 async for text in self.client.stream(messages, config):
-                    emitted = True
+                    text_already_emitted = True
                     yield StreamChunk(text=text)
                 return
             except Exception as exc:
-                info = _to_info(exc)
-                # Solo se reintenta si aun no se emitio texto: reintentar a mitad
-                # del stream duplicaria el contenido que el usuario ya vio.
-                if info.retryable and not emitted and attempt <= config.max_retries:
-                    delay = self._delay(attempt, config)
-                    log.warning(
-                        "%s stream fallo (%s); reintento %d/%d en %.1fs",
-                        self.client.provider, info.kind, attempt, config.max_retries, delay,
-                    )
-                    await asyncio.sleep(delay)
+                info = error_info_from(exc)
+                if should_retry(info, attempt, config, text_already_emitted):
+                    await self._wait_before_retry(info, attempt, config)
                     continue
-                log.error("%s stream fallo definitivo (%s): %s", self.client.provider, info.kind, info.message)
+                log.error(
+                    "%s stream fallo definitivo (%s): %s",
+                    self.client.provider, info.kind, info.message,
+                )
                 yield StreamChunk(error=info)
                 return
+
+    async def _wait_before_retry(
+        self, info: ErrorInfo, attempt: int, config: ModelConfig
+    ) -> None:
+        delay = exponential_backoff_with_jitter(attempt, config)
+        log.warning(
+            "%s fallo (%s); reintento %d/%d en %.1fs",
+            self.client.provider, info.kind, attempt, config.max_retries, delay,
+        )
+        await asyncio.sleep(delay)
+
+
+def as_messages(prompt: str | list[ChatMessage]) -> list[ChatMessage]:
+    if isinstance(prompt, str):
+        return [ChatMessage(role="user", content=prompt)]
+    return prompt

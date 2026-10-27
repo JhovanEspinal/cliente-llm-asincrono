@@ -1,5 +1,3 @@
-"""Manager con un cliente falso: reintentos, fallos controlados y streaming."""
-
 import pytest
 
 from llm_client import (
@@ -16,8 +14,6 @@ AUTH = ErrorInfo(kind="auth", message="API key invalida", retryable=False)
 
 
 class FakeClient(BaseLLMClient):
-    """Falla con los errores de `errors` (en orden) y luego responde bien."""
-
     provider = "anthropic"
     model = "fake"
 
@@ -66,7 +62,8 @@ async def test_rate_limit_persistente_devuelve_error_sin_excepcion():
     resp = await manager(client).generate("hola")
     assert not resp.ok
     assert resp.error.kind == "rate_limit"
-    assert client.calls == FAST.max_retries + 1  # intento inicial + reintentos
+    initial_attempt_plus_retries = FAST.max_retries + 1
+    assert client.calls == initial_attempt_plus_retries
 
 
 async def test_error_no_reintentable_no_se_reintenta():
@@ -88,12 +85,12 @@ async def test_stream_reintenta_si_falla_antes_del_primer_token():
     assert client.calls == 2
 
 
-async def test_stream_no_reintenta_a_mitad_y_emite_error_controlado():
+async def test_stream_no_reintenta_a_mitad_para_no_duplicar_texto_y_emite_error_controlado():
     client = FakeClient(errors=[RATE_LIMIT], fail_after_chunks=1)
     chunks = [c async for c in manager(client).stream("hola")]
     assert chunks[0].text == "Hola"
     assert chunks[-1].error.kind == "rate_limit"
-    assert client.calls == 1  # reintentar duplicaria "Hola"
+    assert client.calls == 1
 
 
 async def test_error_inesperado_no_tumba_el_loop():

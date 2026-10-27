@@ -1,5 +1,3 @@
-"""Clientes concretos: OpenAI y Anthropic con sus SDKs asincronos oficiales."""
-
 import time
 from collections.abc import AsyncIterator
 
@@ -10,6 +8,8 @@ from pydantic import SecretStr
 from .base import BaseLLMClient, LLMError
 from .schemas import ChatMessage, ErrorInfo, ModelConfig, ModelResponse, Usage
 
+SDK_RETRIES_DISABLED = 0
+
 
 def _status_error(status: int, message: str) -> ErrorInfo:
     if status >= 500:
@@ -18,7 +18,6 @@ def _status_error(status: int, message: str) -> ErrorInfo:
 
 
 def _normalize_openai_error(exc: Exception) -> LLMError:
-    # APITimeoutError hereda de APIConnectionError: ambos son fallos de red.
     if isinstance(exc, openai.RateLimitError):
         info = ErrorInfo(kind="rate_limit", message=str(exc), retryable=True)
     elif isinstance(exc, openai.APIConnectionError):
@@ -53,14 +52,20 @@ class OpenAIClient(BaseLLMClient):
         self, api_key: SecretStr, model: str, base_url: str | None = None
     ) -> None:
         self.model = model
-        # max_retries=0: los reintentos los controla el manager, no el SDK.
         self._client = openai.AsyncOpenAI(
-            api_key=api_key.get_secret_value(), base_url=base_url, max_retries=0
+            api_key=api_key.get_secret_value(),
+            base_url=base_url,
+            max_retries=SDK_RETRIES_DISABLED,
         )
 
     @staticmethod
     def _payload(messages: list[ChatMessage]) -> list[dict[str, str]]:
         return [{"role": m.role, "content": m.content} for m in messages]
+
+    @staticmethod
+    def _text_of(chunk) -> str | None:
+        has_choices = bool(chunk.choices)
+        return chunk.choices[0].delta.content if has_choices else None
 
     async def generate(
         self, messages: list[ChatMessage], config: ModelConfig
@@ -106,9 +111,9 @@ class OpenAIClient(BaseLLMClient):
                 stream=True,
             )
             async for chunk in stream:
-                # Algunos chunks (p. ej. el ultimo) llegan sin choices o sin texto.
-                if chunk.choices and chunk.choices[0].delta.content:
-                    yield chunk.choices[0].delta.content
+                text = self._text_of(chunk)
+                if text:
+                    yield text
         except openai.OpenAIError as exc:
             raise _normalize_openai_error(exc) from exc
 
@@ -121,35 +126,43 @@ class AnthropicClient(BaseLLMClient):
     ) -> None:
         self.model = model
         self._client = anthropic.AsyncAnthropic(
-            api_key=api_key.get_secret_value(), base_url=base_url, max_retries=0
+            api_key=api_key.get_secret_value(),
+            base_url=base_url,
+            max_retries=SDK_RETRIES_DISABLED,
         )
 
-    def _kwargs(self, messages: list[ChatMessage], config: ModelConfig) -> dict:
-        # Anthropic recibe el system prompt aparte, no dentro de messages.
-        # No se envia `temperature`: la API actual de Anthropic ya no acepta
-        # parametros de muestreo (el SDK 2.x ni siquiera los expone), asi que
-        # ModelConfig.temperature solo aplica a OpenAI.
-        system = "\n".join(m.content for m in messages if m.role == "system")
-        kwargs: dict = {
+    @staticmethod
+    def _system_prompt(messages: list[ChatMessage]) -> str:
+        return "\n".join(m.content for m in messages if m.role == "system")
+
+    @staticmethod
+    def _conversation(messages: list[ChatMessage]) -> list[dict[str, str]]:
+        return [
+            {"role": m.role, "content": m.content}
+            for m in messages
+            if m.role != "system"
+        ]
+
+    def _request_params(self, messages: list[ChatMessage], config: ModelConfig) -> dict:
+        params: dict = {
             "model": self.model,
-            "messages": [
-                {"role": m.role, "content": m.content}
-                for m in messages
-                if m.role != "system"
-            ],
+            "messages": self._conversation(messages),
             "max_tokens": config.max_tokens,
             "timeout": config.timeout_s,
         }
-        if system:
-            kwargs["system"] = system
-        return kwargs
+        system_prompt = self._system_prompt(messages)
+        if system_prompt:
+            params["system"] = system_prompt
+        return params
 
     async def generate(
         self, messages: list[ChatMessage], config: ModelConfig
     ) -> ModelResponse:
         start = time.perf_counter()
         try:
-            resp = await self._client.messages.create(**self._kwargs(messages, config))
+            resp = await self._client.messages.create(
+                **self._request_params(messages, config)
+            )
         except anthropic.AnthropicError as exc:
             raise _normalize_anthropic_error(exc) from exc
         return ModelResponse(
@@ -169,7 +182,7 @@ class AnthropicClient(BaseLLMClient):
     ) -> AsyncIterator[str]:
         try:
             async with self._client.messages.stream(
-                **self._kwargs(messages, config)
+                **self._request_params(messages, config)
             ) as stream:
                 async for text in stream.text_stream:
                     yield text

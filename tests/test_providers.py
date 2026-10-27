@@ -1,9 +1,7 @@
-"""Clientes OpenAI y Anthropic con el SDK simulado (sin red ni API keys)."""
-
 from types import SimpleNamespace as NS
 
 import anthropic
-import httpx2 as httpx  # los SDKs actuales de openai/anthropic usan httpx2
+import httpx2 as httpx
 import openai
 import pytest
 from pydantic import SecretStr
@@ -21,9 +19,6 @@ REQ = httpx.Request("POST", "https://api.test/v1")
 def http_error(sdk, cls_name, status):
     resp = httpx.Response(status, request=REQ)
     return getattr(sdk, cls_name)("boom", response=resp, body=None)
-
-
-# ---------- OpenAI ----------
 
 
 async def agen(items):
@@ -52,8 +47,8 @@ async def test_openai_generate_normaliza_respuesta():
 async def test_openai_stream_ignora_chunks_vacios():
     chunks = [
         NS(choices=[NS(delta=NS(content="Ho"))]),
-        NS(choices=[]),  # chunk sin choices
-        NS(choices=[NS(delta=NS(content=None))]),  # chunk sin texto
+        NS(choices=[]),
+        NS(choices=[NS(delta=NS(content=None))]),
         NS(choices=[NS(delta=NS(content="la"))]),
     ]
 
@@ -83,9 +78,6 @@ async def test_openai_errores_se_normalizan(exc, kind, retryable):
     with pytest.raises(LLMError) as info:
         await openai_client(create).generate(MSGS, CONFIG)
     assert info.value.info.kind == kind and info.value.info.retryable is retryable
-
-
-# ---------- Anthropic ----------
 
 
 class FakeStream:
@@ -120,7 +112,7 @@ async def test_anthropic_generate_separa_system_y_no_envia_temperature():
     assert resp.text == "Hola!" and resp.usage.input_tokens == 4
     assert seen["system"] == "Responde breve."
     assert all(m["role"] != "system" for m in seen["messages"])
-    assert "temperature" not in seen  # la API de Anthropic ya no lo acepta
+    assert "temperature" not in seen
 
 
 async def test_anthropic_stream_entrega_fragmentos():

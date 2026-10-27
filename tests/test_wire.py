@@ -1,11 +1,3 @@
-"""Los SDKs REALES (openai / anthropic) contra un servidor HTTP local.
-
-A diferencia de test_providers.py, aqui NO se simula el SDK: se ejecuta de
-verdad (construccion del request, headers, parseo de la respuesta, SSE,
-excepciones) y solo se sustituye la red por un servidor local. Sirve para
-comprobar que nuestro codigo usa los SDKs como realmente funcionan.
-"""
-
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -29,11 +21,9 @@ FAST = ModelConfig(max_retries=2, retry_base_delay_s=0)
 
 
 class FakeAPI:
-    """Servidor local con respuestas con el formato real de cada API."""
-
     def __init__(self):
-        self.requests: list[dict] = []  # {"path", "headers", "body"}
-        self.failures: list[int] = []  # codigos HTTP a devolver antes de responder bien
+        self.requests: list[dict] = []
+        self.http_failures_before_success: list[int] = []
         handler = self._make_handler()
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}"
@@ -66,8 +56,8 @@ class FakeAPI:
                         "body": body,
                     }
                 )
-                if api.failures:
-                    status = api.failures.pop(0)
+                if api.http_failures_before_success:
+                    status = api.http_failures_before_success.pop(0)
                     err = {"error": {"message": f"fallo {status}", "type": "x"}}
                     if self.path.endswith("/v1/messages"):
                         err = {"type": "error", "error": {"type": "x", "message": f"fallo {status}"}}
@@ -147,9 +137,6 @@ def anthropic_client(api):
     return AnthropicClient(SecretStr("sk-ant-test"), "claude-haiku-5-5", base_url=api.url)
 
 
-# ---------- OpenAI con el SDK real ----------
-
-
 async def test_openai_generate(api):
     resp = await openai_client(api).generate(MSGS, ModelConfig(temperature=1.5, max_tokens=300))
     assert resp.text == "Desorden molecular"
@@ -166,9 +153,6 @@ async def test_openai_stream(api):
     assert api.requests[0]["body"]["stream"] is True
 
 
-# ---------- Anthropic con el SDK real ----------
-
-
 async def test_anthropic_generate(api):
     resp = await anthropic_client(api).generate(MSGS, ModelConfig(temperature=1.5, max_tokens=300))
     assert resp.text == "Desorden molecular"
@@ -179,8 +163,8 @@ async def test_anthropic_generate(api):
     assert sent["max_tokens"] == 300
     assert "temperature" not in sent
     assert api.requests[0]["headers"]["authorization"] == "Bearer sk-ant-test"
-    # Desde esta version de la API, enviar temperature/top_p/top_k da error 400.
-    assert api.requests[0]["headers"]["anthropic-version"] == "2026-10-21"
+    api_version_that_rejects_sampling_params = "2026-10-21"
+    assert api.requests[0]["headers"]["anthropic-version"] == api_version_that_rejects_sampling_params
 
 
 async def test_anthropic_stream(api):
@@ -189,12 +173,9 @@ async def test_anthropic_stream(api):
     assert api.requests[0]["body"]["stream"] is True
 
 
-# ---------- Manager + SDK real: errores HTTP reales ----------
-
-
 @pytest.mark.parametrize("make_client", [openai_client, anthropic_client])
 async def test_rate_limit_real_se_reintenta_y_se_recupera(api, make_client):
-    api.failures = [429, 429]
+    api.http_failures_before_success = [429, 429]
     manager = AsyncLLMManager(client=make_client(api), config=FAST)
     resp = await manager.generate(MSGS)
     assert resp.ok and resp.attempts == 3 and resp.text == "Desorden molecular"
@@ -202,7 +183,7 @@ async def test_rate_limit_real_se_reintenta_y_se_recupera(api, make_client):
 
 @pytest.mark.parametrize("make_client", [openai_client, anthropic_client])
 async def test_rate_limit_persistente_devuelve_error_controlado(api, make_client):
-    api.failures = [429] * 10
+    api.http_failures_before_success = [429] * 10
     manager = AsyncLLMManager(client=make_client(api), config=FAST)
     resp = await manager.generate(MSGS)
     assert not resp.ok and resp.error.kind == "rate_limit"
@@ -211,7 +192,7 @@ async def test_rate_limit_persistente_devuelve_error_controlado(api, make_client
 
 @pytest.mark.parametrize("make_client", [openai_client, anthropic_client])
 async def test_api_key_invalida_no_se_reintenta(api, make_client):
-    api.failures = [401]
+    api.http_failures_before_success = [401]
     manager = AsyncLLMManager(client=make_client(api), config=FAST)
     resp = await manager.generate(MSGS)
     assert resp.error.kind == "auth" and len(api.requests) == 1
@@ -219,7 +200,7 @@ async def test_api_key_invalida_no_se_reintenta(api, make_client):
 
 @pytest.mark.parametrize("make_client", [openai_client, anthropic_client])
 async def test_stream_con_rate_limit_real_se_recupera(api, make_client):
-    api.failures = [429]
+    api.http_failures_before_success = [429]
     manager = AsyncLLMManager(client=make_client(api), config=FAST)
     chunks = [c async for c in manager.stream(MSGS)]
     assert "".join(c.text for c in chunks) == "Desorden molecular"
@@ -227,7 +208,7 @@ async def test_stream_con_rate_limit_real_se_recupera(api, make_client):
 
 
 async def test_servidor_caido_es_error_de_red_controlado():
-    # Puerto sin servidor: conexion rechazada -> APIConnectionError real del SDK.
-    client = AnthropicClient(SecretStr("sk-ant-test"), "m", base_url="http://127.0.0.1:9")
+    port_with_no_server = "http://127.0.0.1:9"
+    client = AnthropicClient(SecretStr("sk-ant-test"), "m", base_url=port_with_no_server)
     resp = await AsyncLLMManager(client=client, config=FAST).generate(MSGS)
     assert not resp.ok and resp.error.kind == "network"

@@ -1,5 +1,3 @@
-"""Script de validacion: la misma pregunta en modo normal y en streaming."""
-
 import asyncio
 import logging
 
@@ -15,7 +13,7 @@ async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 
     try:
-        manager = AsyncLLMManager()  # proveedor segun LLM_PROVIDER
+        manager = AsyncLLMManager()
     except ValueError as exc:
         print(f"Configuracion invalida: {exc}")
         return
