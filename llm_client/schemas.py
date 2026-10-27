@@ -20,7 +20,7 @@ class ModelConfig(BaseModel):
     """Parametros de la llamada. Pydantic rechaza valores fuera de rango."""
 
     temperature: float = Field(default=0.7, ge=0, le=2)
-    max_tokens: int = Field(default=512, gt=0, le=32_000)
+    max_tokens: int = Field(default=1024, gt=0, le=32_000)
     timeout_s: float = Field(default=30.0, gt=0)
     max_retries: int = Field(default=3, ge=0, le=10)
     retry_base_delay_s: float = Field(default=1.0, ge=0)
@@ -44,6 +44,7 @@ class ModelResponse(BaseModel):
     model: str
     text: str = ""
     usage: Usage | None = None
+    finish_reason: str | None = None  # p. ej. "stop"/"end_turn"; "length"/"max_tokens" = truncada
     latency_s: float = 0.0
     attempts: int = 1
     error: ErrorInfo | None = None

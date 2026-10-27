@@ -41,7 +41,7 @@ async def test_openai_generate_normaliza_respuesta():
     async def create(**kw):
         assert kw["messages"][0] == {"role": "system", "content": "Responde breve."}
         return NS(
-            choices=[NS(message=NS(content="Hola!"))],
+            choices=[NS(message=NS(content="Hola!"), finish_reason="stop")],
             usage=NS(prompt_tokens=5, completion_tokens=2),
         )
 
@@ -105,7 +105,7 @@ def anthropic_client(create=None, stream=None):
     return client
 
 
-async def test_anthropic_generate_separa_system_y_acota_temperatura():
+async def test_anthropic_generate_separa_system_y_no_envia_temperature():
     seen = {}
 
     async def create(**kw):
@@ -113,14 +113,14 @@ async def test_anthropic_generate_separa_system_y_acota_temperatura():
         return NS(
             content=[NS(type="text", text="Hola!")],
             usage=NS(input_tokens=4, output_tokens=1),
+            stop_reason="end_turn",
         )
 
-    config = ModelConfig(temperature=1.8)
-    resp = await anthropic_client(create=create).generate(MSGS, config)
+    resp = await anthropic_client(create=create).generate(MSGS, ModelConfig(temperature=1.8))
     assert resp.text == "Hola!" and resp.usage.input_tokens == 4
     assert seen["system"] == "Responde breve."
     assert all(m["role"] != "system" for m in seen["messages"])
-    assert seen["temperature"] == 1.0  # Anthropic no acepta mas de 1
+    assert "temperature" not in seen  # la API de Anthropic ya no lo acepta
 
 
 async def test_anthropic_stream_entrega_fragmentos():

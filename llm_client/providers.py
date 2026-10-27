@@ -49,11 +49,13 @@ def _normalize_anthropic_error(exc: Exception) -> LLMError:
 class OpenAIClient(BaseLLMClient):
     provider = "openai"
 
-    def __init__(self, api_key: SecretStr, model: str) -> None:
+    def __init__(
+        self, api_key: SecretStr, model: str, base_url: str | None = None
+    ) -> None:
         self.model = model
         # max_retries=0: los reintentos los controla el manager, no el SDK.
         self._client = openai.AsyncOpenAI(
-            api_key=api_key.get_secret_value(), max_retries=0
+            api_key=api_key.get_secret_value(), base_url=base_url, max_retries=0
         )
 
     @staticmethod
@@ -69,7 +71,7 @@ class OpenAIClient(BaseLLMClient):
                 model=self.model,
                 messages=self._payload(messages),
                 temperature=config.temperature,
-                max_tokens=config.max_tokens,
+                max_completion_tokens=config.max_tokens,
                 timeout=config.timeout_s,
             )
         except openai.OpenAIError as exc:
@@ -87,6 +89,7 @@ class OpenAIClient(BaseLLMClient):
             model=self.model,
             text=resp.choices[0].message.content or "",
             usage=usage,
+            finish_reason=resp.choices[0].finish_reason,
             latency_s=time.perf_counter() - start,
         )
 
@@ -98,7 +101,7 @@ class OpenAIClient(BaseLLMClient):
                 model=self.model,
                 messages=self._payload(messages),
                 temperature=config.temperature,
-                max_tokens=config.max_tokens,
+                max_completion_tokens=config.max_tokens,
                 timeout=config.timeout_s,
                 stream=True,
             )
@@ -112,16 +115,20 @@ class OpenAIClient(BaseLLMClient):
 
 class AnthropicClient(BaseLLMClient):
     provider = "anthropic"
-    MAX_TEMPERATURE = 1.0  # la API de Anthropic acepta 0-1, no 0-2
 
-    def __init__(self, api_key: SecretStr, model: str) -> None:
+    def __init__(
+        self, api_key: SecretStr, model: str, base_url: str | None = None
+    ) -> None:
         self.model = model
         self._client = anthropic.AsyncAnthropic(
-            api_key=api_key.get_secret_value(), max_retries=0
+            api_key=api_key.get_secret_value(), base_url=base_url, max_retries=0
         )
 
     def _kwargs(self, messages: list[ChatMessage], config: ModelConfig) -> dict:
         # Anthropic recibe el system prompt aparte, no dentro de messages.
+        # No se envia `temperature`: la API actual de Anthropic ya no acepta
+        # parametros de muestreo (el SDK 2.x ni siquiera los expone), asi que
+        # ModelConfig.temperature solo aplica a OpenAI.
         system = "\n".join(m.content for m in messages if m.role == "system")
         kwargs: dict = {
             "model": self.model,
@@ -130,7 +137,6 @@ class AnthropicClient(BaseLLMClient):
                 for m in messages
                 if m.role != "system"
             ],
-            "temperature": min(config.temperature, self.MAX_TEMPERATURE),
             "max_tokens": config.max_tokens,
             "timeout": config.timeout_s,
         }
@@ -154,6 +160,7 @@ class AnthropicClient(BaseLLMClient):
                 input_tokens=resp.usage.input_tokens,
                 output_tokens=resp.usage.output_tokens,
             ),
+            finish_reason=resp.stop_reason,
             latency_s=time.perf_counter() - start,
         )
 

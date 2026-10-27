@@ -96,6 +96,15 @@ async def test_stream_no_reintenta_a_mitad_y_emite_error_controlado():
     assert client.calls == 1  # reintentar duplicaria "Hola"
 
 
+async def test_error_inesperado_no_tumba_el_loop():
+    class Roto(FakeClient):
+        async def generate(self, messages, config):
+            raise TypeError("bug inesperado")
+
+    resp = await manager(Roto()).generate("hola")
+    assert resp.error.kind == "unknown" and "TypeError" in resp.error.message
+
+
 def test_proveedor_desconocido():
     with pytest.raises(ValueError, match="desconocido"):
         AsyncLLMManager(provider="gemini")

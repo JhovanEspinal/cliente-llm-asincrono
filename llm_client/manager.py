@@ -31,6 +31,15 @@ API_KEY_VARS: dict[str, str] = {
 }
 
 
+def _to_info(exc: Exception) -> ErrorInfo:
+    """Errores del proveedor ya vienen normalizados; el resto se registra con
+    traceback y se devuelve como `unknown` (no reintentable) en vez de tumbar el loop."""
+    if isinstance(exc, LLMError):
+        return exc.info
+    log.exception("Error inesperado en el cliente LLM")
+    return ErrorInfo(kind="unknown", message=f"{type(exc).__name__}: {exc}")
+
+
 def build_client(provider: str) -> BaseLLMClient:
     """Factory: crea el cliente concreto leyendo las variables de entorno."""
     if provider not in API_KEY_VARS:
@@ -43,7 +52,11 @@ def build_client(provider: str) -> BaseLLMClient:
         raise ValueError(f"Falta la variable de entorno {key_var} para {provider}.")
     model = os.getenv(f"{provider.upper()}_MODEL") or DEFAULT_MODELS[provider]
     cls = OpenAIClient if provider == "openai" else AnthropicClient
-    return cls(api_key=SecretStr(api_key), model=model)
+    return cls(
+        api_key=SecretStr(api_key),
+        model=model,
+        base_url=os.getenv(f"{provider.upper()}_BASE_URL") or None,
+    )
 
 
 class AsyncLLMManager:
@@ -87,8 +100,8 @@ class AsyncLLMManager:
                 response = await self.client.generate(messages, config)
                 response.attempts = attempt
                 return response
-            except LLMError as exc:
-                info = exc.info
+            except Exception as exc:
+                info = _to_info(exc)
                 if info.retryable and attempt <= config.max_retries:
                     delay = self._delay(attempt, config)
                     log.warning(
@@ -119,8 +132,8 @@ class AsyncLLMManager:
                     emitted = True
                     yield StreamChunk(text=text)
                 return
-            except LLMError as exc:
-                info = exc.info
+            except Exception as exc:
+                info = _to_info(exc)
                 # Solo se reintenta si aun no se emitio texto: reintentar a mitad
                 # del stream duplicaria el contenido que el usuario ya vio.
                 if info.retryable and not emitted and attempt <= config.max_retries:
