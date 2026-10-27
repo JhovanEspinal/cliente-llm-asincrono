@@ -65,4 +65,4 @@ async for chunk in manager.stream("¿Qué es la entropía?"):
 
 - **Temperatura en Anthropic:** la API acepta 0–1, así que `AnthropicClient` limita el valor a 1.0 aunque `ModelConfig` permita hasta 2 (rango de OpenAI).
 - **System prompt:** Anthropic lo recibe aparte de `messages`; `AnthropicClient` lo separa automáticamente.
-- **Tests de OpenAI:** el cliente de OpenAI se verifica con SDK simulado; la prueba en vivo se hizo con Anthropic.
+- **Estado de las pruebas:** ambos clientes se verifican con los SDKs simulados (`python -m pytest`). Aún no se ejecutó `main.py` contra una API real; para hacerlo, añade una API key en `.env`.
