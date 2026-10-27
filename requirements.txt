@@ -1,0 +1,8 @@
+openai>=3.39
+anthropic>=2.3
+pydantic>=2.14
+python-dotenv>=1.2
+
+# Solo para correr los tests
+pytest>=9.1
+pytest-asyncio>=1.4
